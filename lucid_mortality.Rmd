@@ -1,0 +1,431 @@
+---
+title: "LUCID: Mortality analysis"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+    
+```{r setup, include=FALSE}
+lib_paths <- .libPaths()
+lib_paths <- c("//win.ad.jhu.edu/Users$/HOME/R/win-library/4.0", lib_paths)
+.libPaths(lib_paths)
+knitr::opts_chunk$set(message=FALSE, warning=FALSE, fig.align="center")
+```
+
+
+
+
+
+# Load packages and read data
+
+Load packages and utility functions. Read in clean data.
+
+```{r message=FALSE}
+library(SummarizedExperiment)
+library(matrixStats)
+library(readxl)
+library(readr)
+library(tidyr)
+library(dplyr)
+library(ggplot2)
+library(purrr)
+library(stringr)
+library(lubridate)
+library(limma)
+library(splines)
+library(glue)
+library(caret)
+library(glmnet)
+library(randomForest)
+
+source("functions_utils.R")
+source("functions_limma_analysis.R")
+source("functions_ml.R")
+
+load("../data/summ_exps_imputed_ruv.rda")
+```
+
+Read in Eugene's annotations to identify drug metabolites.
+
+```{r}
+metab_annots <- read_excel("../data/Broad data--redundant metabolites_02032022.xlsx", sheet = "Sheet1", range = "A1:I665", col_names = TRUE)
+colnames(metab_annots) <- fix_names(colnames(metab_annots))
+metab_annots <- metab_annots %>% select(-`...6`)
+
+## Make sure that there is only one way that "medication" is spelled
+metab_annots %>% dplyr::count(comment)
+
+drug_metabs <- metab_annots %>%
+    filter(comment=="medication") %>%
+    pull(metabolite)
+```
+
+
+
+
+
+# Remove internal standards and count metabolites pre-filtering
+
+```{r}
+se_c8_main <- remove_internal_standards(se_c8_main)
+se_hilic_pos_main <- remove_internal_standards(se_hilic_pos_main)
+se_hilic_neg_main <- remove_internal_standards(se_hilic_neg_main)
+```
+
+```{r}
+se_list <- list(
+    c8 = se_c8_main,
+    hilic_pos = se_hilic_pos_main,
+    hilic_neg = se_hilic_neg_main
+)
+se <- merge_ses_across_injections(se_list)
+nrow(se)
+rowData(se) %>% as.data.frame() %>% count(is.na(hmdb_id))
+```
+
+
+
+
+
+# Explore distribution of days to death
+
+Explore distribution of days from dialysis initiation to death: in Frenova and Canada separately and combined.
+
+```{r}
+cd_c8 <- colData(se_c8_main) %>% as.data.frame()
+cd_c8_subs <- cd_c8 %>% filter(country=="Canada" | frenova, event_name == "Baseline")
+ggplot(cd_c8_subs, aes(x = daysdeath, color = country)) +
+    geom_density()
+cd_c8_subs %>%
+    group_by(country) %>%
+    summarize(mean_dd = mean(daysdeath, na.rm = TRUE), sd_dd = sd(daysdeath, na.rm = TRUE))
+
+cd_c8_subs %>% 
+    mutate(
+        death_by_1year = daysdeath <= 365 & !is.na(daysdeath)
+    ) %>%
+    count(death_by_1year)
+cd_c8_subs %>% 
+    mutate(
+        death_by_2year = daysdeath <= 365*2 & !is.na(daysdeath)
+    ) %>%
+    count(death_by_2year)
+```
+
+
+
+
+
+# Summary statistics across covariates
+
+For the participants in the mortality analysis:
+
+```{r}
+variables <- c("age", "gender", "race", "bmi", "cad", "cardiac_arrest", "cardiac_arrhythmias", "mi", "stroke", "cv_disease", "diabetes", "alb", "ktv", "dialysis_duration", "does_the_subject_have_clinically_documented_hypertension")
+variable_types <- c("q", "c", "c", "q", rep("c", 7), rep("q", 3), "c")
+
+show_summary_stats <- function(.data, vars, var_types) {
+    for (i in seq_along(vars)) {
+        var <- vars[i]
+        cat(var, "-------------------------------------------:\n")
+        if (var_types[i]=="c")
+            .data %>% count(.data[[var]]) %>% mutate(frac = n/sum(n)) %>% print()
+        else {
+            print(summary(.data[[var]]))
+        }
+    }
+}
+show_summary_stats(cd_c8_subs, vars = variables, var_types = variable_types)
+```
+
+For LUCID participants excluded from mortality analysis:
+
+```{r}
+cd_c8 <- colData(se_c8_main) %>% as.data.frame() %>% filter(event_name=="Baseline")
+bool_mort <- (cd_c8$country=="Canada" | cd_c8$frenova) & cd_c8$event_name == "Baseline"
+bool_other <- !bool_mort
+
+cd_c8_other <- cd_c8[bool_other,]
+show_summary_stats(cd_c8_other, vars = variables, var_types = variable_types)
+```
+
+For all LUCID participants:
+
+```{r}
+show_summary_stats(cd_c8, vars = variables, var_types = variable_types)
+```
+
+Checking units for albumin in Canada and US. It does seem like Canada is in g/L and US in g/dL.
+
+```{r}
+print("alb")
+summary(cd_c8_subs %>% filter(country=="Canada") %>% pull(alb))
+summary(cd_c8_subs %>% filter(country=="US") %>% pull(alb))
+
+print("hgb")
+summary(cd_c8_subs %>% filter(country=="Canada") %>% pull(hgb))
+summary(cd_c8_subs %>% filter(country=="US") %>% pull(hgb))
+
+print("ferritin")
+summary(cd_c8_subs %>% filter(country=="Canada") %>% pull(ferritin))
+summary(cd_c8_subs %>% filter(country=="US") %>% pull(ferritin))
+
+print("phosph")
+summary(cd_c8_subs %>% filter(country=="Canada") %>% pull(phosph))
+summary(cd_c8_subs %>% filter(country=="US") %>% pull(phosph))
+
+print("ipth")
+summary(cd_c8_subs %>% filter(country=="Canada") %>% pull(ipth))
+summary(cd_c8_subs %>% filter(country=="US") %>% pull(ipth))
+
+print("ktv")
+summary(cd_c8_subs %>% filter(country=="Canada") %>% pull(ktv))
+summary(cd_c8_subs %>% filter(country=="US") %>% pull(ktv))
+```
+
+Lab distributions for several lab measurements in Canada:
+
+```{r}
+summ_stats <- function(x) {
+    cat("  Min:", min(x, na.rm = TRUE) %>% round(2), "\n")
+    cat("  Max:", max(x, na.rm = TRUE) %>% round(2), "\n")
+    cat("  Mean:", mean(x, na.rm = TRUE) %>% round(2), "\n")
+    cat("  Median:", median(x, na.rm = TRUE) %>% round(2), "\n")
+    cat("  SD:", sd(x, na.rm = TRUE) %>% round(2), "\n")
+}
+cat("Albumin:\n")
+summ_stats(cd_c8_subs %>% filter(country=="Canada") %>% pull(alb))
+
+cat("Calcium:\n")
+summ_stats(cd_c8_subs %>% filter(country=="Canada") %>% pull(CA))
+
+cat("Creatinine:\n")
+summ_stats(cd_c8_subs %>% filter(country=="Canada") %>% pull(CRE))
+
+cat("Ferritin:\n")
+summ_stats(cd_c8_subs %>% filter(country=="Canada") %>% pull(ferritin))
+
+cat("Hemoglobin:\n")
+summ_stats(cd_c8_subs %>% filter(country=="Canada") %>% pull(hgb))
+
+cat("Iron:\n")
+summ_stats(cd_c8_subs %>% filter(country=="Canada") %>% pull(IRON))
+
+cat("Phosphate:\n")
+summ_stats(cd_c8_subs %>% filter(country=="Canada") %>% pull(phosph))
+
+cat("Parathyroid hormone (CA):\n")
+summ_stats(cd_c8_subs %>% filter(country=="Canada") %>% pull(ipth))
+
+cat("Toral iron binding capacity (CA):\n")
+summ_stats(cd_c8_subs %>% filter(country=="Canada") %>% pull(TIBC))
+```
+
+Sample sizes
+
+```{r}
+cat("Original sample size:", nrow(cd_c8_subs), "\n")
+
+cd_c8_subs_nonlabs <- cd_c8_subs %>% select(age, gender, race, bmi, cv_disease, diabetes, dialysis_duration)
+cc_nonlabs <- complete.cases(cd_c8_subs_nonlabs)
+cat("# dropped due to missing data on race, bmi, CV disease, dialysis duration:", sum(!cc_nonlabs), "\n")
+
+cd_c8_subs_all_covars <- cd_c8_subs %>% select(age, gender, race, bmi, cv_disease, diabetes, dialysis_duration, alb, ktv)
+cc_all <- complete.cases(cd_c8_subs_all_covars)
+cat("# dropped due to missing data across all covariates:", sum(!cc_all), "\n")
+```
+
+
+```{r}
+cd_c8_subs %>% 
+    filter(cc_nonlabs) %>%
+    mutate(
+        death_by_1year = daysdeath <= 365 & !is.na(daysdeath)
+    ) %>%
+    count(death_by_1year)
+cd_c8_subs %>% 
+    filter(cc_nonlabs) %>%
+    mutate(
+        death_by_2year = daysdeath <= 365*2 & !is.na(daysdeath)
+    ) %>%
+    count(death_by_2year)
+```
+
+
+
+
+# Filtering metabolites based on missingness and zero variance
+
+This filtering was done earlier based on all 1000 samples. Are there any metabolites that remain 
+
+- Remove metabolites with >= 95% missingness
+- Remove metabolites where the variance in abundance among non-missing values is zero
+
+```{r}
+bool_c8 <- colData(se_c8_main) %>%
+    as.data.frame() %>%
+    mutate(keep = (country=="Canada" | frenova) & event_name == "Baseline") %>%
+    pull(keep)
+bool_hilic_pos <- colData(se_hilic_pos_main) %>%
+    as.data.frame() %>%
+    mutate(keep = (country=="Canada" | frenova) & event_name == "Baseline") %>%
+    pull(keep)
+bool_hilic_neg <- colData(se_hilic_neg_main) %>%
+    as.data.frame() %>%
+    mutate(keep = (country=="Canada" | frenova) & event_name == "Baseline") %>%
+    pull(keep)
+se_c8_main <- filter_metabs(se_c8_main[,bool_c8])
+se_hilic_pos_main <- filter_metabs(se_hilic_pos_main[,bool_hilic_pos])
+se_hilic_neg_main <- filter_metabs(se_hilic_neg_main[,bool_hilic_neg])
+```
+
+
+
+
+
+# `limma` analysis
+
+Count number of metabolites.
+
+```{r}
+se_list <- list(
+    c8 = se_c8_main,
+    hilic_pos = se_hilic_pos_main,
+    hilic_neg = se_hilic_neg_main
+)
+
+se <- merge_ses_across_injections(se_list)
+nrow(se)
+rowData(se) %>% as.data.frame() %>% count(is.na(hmdb_id))
+```
+
+`limma` analysis for 1-year and 2-year mortality.
+
+- Full set of covariates: `alb` needs to be manually log-transformed; `ktv` is not log-transformed. `alb_imp` is already log-transformed.
+
+```{r}
+df_analysis_versions <- crossing(
+    mod_form = c(
+        ~mort_outcome+age+gender+race+cv_disease+diabetes+ns(bmi,df=3)+ns(log(alb),df=3)+ns(ktv,df=3)+ns(dialysis_duration,df=3)+country,
+        ~mort_outcome+age+gender+race+cv_disease+diabetes+ns(bmi,df=3)+ns(alb_imp,df=3)+ns(ktv_imp,df=3)+ns(dialysis_duration,df=3)+country,
+        ~mort_outcome
+    ),
+    metab_type = c("qrilc_no_ruv", "qrilc_ruv")
+) %>% 
+    mutate(analysis_version = c("ruv_no_imp_no", "ruv_yes_imp_no", "ruv_no_imp_yes", "ruv_yes_imp_yes", "ruv_no_unadj", "ruv_yes_unadj"))
+
+limma_mort_results_list <- lapply(seq_len(nrow(df_analysis_versions)), function(i) {
+    res <- run_mort_analysis(
+        se_list = se_list,
+        mod_form = df_analysis_versions$mod_form[[i]],
+        metab_type = df_analysis_versions$metab_type[i],
+        drug_metabs = drug_metabs
+    )
+    bind_rows(res, .id = "outcome") %>%
+        mutate(analysis_version = df_analysis_versions$analysis_version[i])
+})
+```
+
+Create `data.frame` of all results (across all sensitivity analyses).
+
+```{r}
+all_mort_results <- bind_rows(limma_mort_results_list) %>%
+    mutate(metab_id = ifelse(is.na(metabolite), compound_id, metabolite))
+
+all_mort_results %>% filter(adj_pval < 0.1)
+all_mort_results %>% filter(adj_pval < 0.1, metabolite=="quinolinate")
+all_mort_results %>% filter(adj_pval < 0.1, metabolite=="mesaconate")
+```
+
+ML analyses - known compounds only
+
+```{r}
+df_analysis_versions <- crossing(
+    adj_vars = list(
+        c("age", "gender", "race", "cv_disease", "diabetes", "bmi", "alb", "ktv", "dialysis_duration", "country"),
+        c("age", "gender", "race", "cv_disease", "diabetes", "bmi", "alb_imp", "ktv_imp", "dialysis_duration", "country"),
+        c()
+    ),
+    metab_type = c("qrilc_no_ruv", "qrilc_ruv")
+) %>%
+    mutate(analysis_version = c("ruv_no_imp_no", "ruv_yes_imp_no", "ruv_no_imp_yes", "ruv_yes_imp_yes", "ruv_no_unadj", "ruv_yes_unadj"))
+
+set.seed(355)
+ml_mort_models_list <- lapply(seq_len(nrow(df_analysis_versions)), function(i) {
+    fit_ml_models_mort(
+        se_list = se_list,
+        adjustment_vars = df_analysis_versions$adj_vars[[i]],
+        only_known_metabs = TRUE,
+        metab_type = df_analysis_versions$metab_type[i]
+    )
+})
+ml_mort_results_list <- lapply(seq_along(ml_mort_models_list), function(i) {
+    res <- ml_mort_models_list[[i]]
+    res_df <- ml_results_to_df(list(res))
+    res_df %>%
+        rename(outcome = symptom, importance_lasso = importance_lasso_1, importance_rf = importance_rf_1) %>%
+        mutate(analysis_version = df_analysis_versions$analysis_version[i])
+})
+
+```
+
+Report accuracy measures for ML models
+
+```{r}
+df_ml_acc <- lapply(seq_along(ml_mort_models_list), function(i) {
+    mod_lasso <- ml_mort_models_list[[i]][["1_year_mort"]][[1]]
+    mod_rf <- ml_mort_models_list[[i]][["1_year_mort"]][[2]]
+    
+    lasso_res <- mod_lasso$results %>% 
+        filter(lambda==mod_lasso$bestTune$lambda)
+    rf_res <- mod_rf$results %>% 
+        filter(mtry==mod_rf$bestTune$mtry)
+    
+    tibble(
+        analysis_version = df_analysis_versions$analysis_version[i],
+        lasso_acc = lasso_res$Accuracy,
+        lasso_acc_sd = lasso_res$AccuracySD,
+        rf_acc = rf_res$Accuracy
+    )
+}) %>% bind_rows()
+```
+
+**Note:** ML analyses on the unknowns (`only_known_metabs = FALSE`) causes memory errors--too many unknowns
+
+Merge ML results and limma results.
+
+```{r}
+df_ml_mort_results <- bind_rows(ml_mort_results_list)
+
+all_mort_results_limma_ml <- all_mort_results %>% left_join(df_ml_mort_results, by = c("outcome", "metab_id", "analysis_version"))
+```
+
+Subset to known metabolites with significant associations.
+
+```{r}
+signif_metabs <- all_mort_results_limma_ml %>%
+    filter(adj_pval < 0.1, !is.na(metabolite)) %>%
+    pull(metabolite) %>%
+    unique()
+all_mort_results_limma_ml <- all_mort_results_limma_ml %>%
+    mutate(FC = round(2^logFC, 2)) %>%
+    select(outcome, method, metabolite, hmdb_id, logFC, FC, P.Value, adj_pval, importance_lasso, importance_rf, analysis_version, starts_with("mod_coeff_"))
+all_mort_results_limma_ml_signif <- all_mort_results_limma_ml %>%
+    filter(metabolite %in% signif_metabs) %>%
+    arrange(metabolite, outcome)
+```
+
+```{r}
+all_mort_results_limma_ml_signif %>% filter(metabolite %in% c("mesaconate", "quinolinate"), outcome=="1_year_mort") %>% select(metabolite, importance_lasso:analysis_version)
+```
+
+Write results to file.
+
+```{r}
+write_csv(df_ml_acc, file = "../results/tables/mort_ml_acc.csv")
+
+write_csv(all_mort_results_limma_ml, file = "../results/tables/mort_results_all.csv")
+write_csv(all_mort_results_limma_ml_signif, file = "../results/tables/mort_results_signif.csv")
+```
+
